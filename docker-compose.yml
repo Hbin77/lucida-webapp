@@ -9,7 +9,7 @@ services:
       # Comma-separated list of allowed CORS origins. With same-origin
       # nginx in front, this is rarely needed at runtime; localhost is
       # included so local docker-compose dev still works.
-      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,https://lucida.hbinserver.cloud}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3010,https://lucida.hbinserver.cloud}
     expose:
       - "8000"
     ports:
