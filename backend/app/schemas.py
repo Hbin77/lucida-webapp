@@ -35,7 +35,13 @@ class HealthResponse(BaseModel):
     status: Literal["ok"]
     model_loaded: bool
     model_auc: float
+    # explainer = the configured explainer at startup.
+    # last_used_explainer = the explainer that actually served the most
+    # recent /api/explain request. They diverge when a runtime fallback
+    # fires despite SHAP being available at startup — the latter is the
+    # authority for interpreting a specific /api/explain response.
     explainer: Literal["tree_shap", "single_feature_ablation"] = "single_feature_ablation"
+    last_used_explainer: Literal["tree_shap", "single_feature_ablation"] = "single_feature_ablation"
 
 
 # ── Live Typing Lab — raw-features endpoint ──────────────────────
@@ -55,8 +61,23 @@ class FeatureContribution(BaseModel):
     feature: str
     value: float
     baseline: float
-    delta_score: float = Field(..., description="How many score points "
-                                                 "this feature shifts vs HC baseline.")
+    delta_score: float = Field(
+        ...,
+        description=(
+            "How many cognitive-score points this feature contributes. "
+            "Sign convention is uniform across explainers: negative means "
+            "the feature pulls the score DOWN from the baseline; positive "
+            "means it pushes the score UP. "
+            "Mathematical definition depends on the explainer that served "
+            "the response — check /api/health.last_used_explainer:\n"
+            "  • tree_shap: delta_score = -100·φᵢ, where φᵢ is the Shapley "
+            "    value for the at-risk class. Additive: Σ delta_score ≈ "
+            "    cognitive_score - baseline_score (SHAP efficiency).\n"
+            "  • single_feature_ablation: delta_score = cognitive_score - "
+            "    cognitive_score_with_this_feature_set_to_HC_mean. NOT "
+            "    additive (single-feature counterfactual)."
+        ),
+    )
 
 
 class CohortDistance(BaseModel):
@@ -69,4 +90,17 @@ class ExplainResponse(BaseModel):
     pathway: Literal["A", "B", "C"]
     contributions: list[FeatureContribution]
     cohort_distances: list[CohortDistance]
-    baseline_score: int = Field(..., description="Score if all features were HC means.")
+    baseline_score: int = Field(
+        ...,
+        description=(
+            "Reference score against which `contributions` are decomposed. "
+            "Under tree_shap this is the model's training-mean prediction "
+            "(SHAP expected_value translated to score points). Under "
+            "single_feature_ablation this is the score of an all-HC-mean "
+            "input. Check `explainer` to know which one."
+        ),
+    )
+    explainer: Literal["tree_shap", "single_feature_ablation"] = Field(
+        ...,
+        description="The explainer that produced this specific response.",
+    )

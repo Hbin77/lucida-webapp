@@ -486,6 +486,7 @@ export default function LiveTypingLab() {
                       finalScore={explanation.cognitive_score}
                       contributions={explanation.contributions}
                       labelOf={labelOf}
+                      explainerKind={explanation.explainer}
                     />
                   </div>
                   <p

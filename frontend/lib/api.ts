@@ -48,12 +48,18 @@ export type CohortDistance = {
   distance: number;
 };
 
+export type ExplainerKind = "tree_shap" | "single_feature_ablation";
+
 export type ExplainResponse = {
   cognitive_score: number;
   pathway: "A" | "B" | "C";
   contributions: FeatureContribution[];
   cohort_distances: CohortDistance[];
   baseline_score: number;
+  /** Which explainer produced THIS response. /api/health surfaces both a
+   *  startup-configured and a last-used field; this field is response-
+   *  scoped, so it is the right thing to read for chart labels. */
+  explainer: ExplainerKind;
 };
 
 // ─────────────────────────────────────────────────────────────────

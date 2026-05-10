@@ -2,12 +2,21 @@
 
 import type { FeatureContribution } from "@/lib/api";
 
+type ExplainerKind = "tree_shap" | "single_feature_ablation";
+
 type Props = {
-  baselineScore: number; // typically 100 (HC baseline)
+  /** Baseline score the contributions decompose from. Under tree_shap
+   *  this is the SHAP expected_value translated to score points; under
+   *  single_feature_ablation it is the score of an all-HC-mean input. */
+  baselineScore: number;
   finalScore: number;
   contributions: FeatureContribution[];
   /** Localized human label per feature key. */
   labelOf: (k: string) => string;
+  /** Which explainer produced the contributions. Drives the baseline
+   *  label so a reviewer can tell whether the left rail is "training
+   *  mean" (tree_shap) or "HC baseline" (ablation). */
+  explainerKind?: ExplainerKind;
 };
 
 const W = 540;
@@ -16,14 +25,22 @@ const PAD_X = 110;
 const PAD_R = 60;
 const BAR_W_MAX = W - PAD_X - PAD_R;
 
+function baselineLabel(kind: ExplainerKind | undefined): string {
+  if (kind === "tree_shap") return "baseline (training mean)";
+  if (kind === "single_feature_ablation") return "baseline (HC mean)";
+  return "baseline";
+}
+
 /** Feature-contribution waterfall.
- *  Baseline (HC) score on the left, final score on the right;
- *  each row is one feature's signed contribution. */
+ *  Baseline score on the left, final score on the right; each row is
+ *  one feature's signed contribution. Under SHAP the contributions
+ *  sum (up to rounding) to finalScore − baselineScore. */
 export default function Waterfall({
   baselineScore,
   finalScore,
   contributions,
   labelOf,
+  explainerKind,
 }: Props) {
   // Sort by absolute magnitude — biggest movers first.
   const rows = [...contributions].sort(
@@ -37,9 +54,10 @@ export default function Waterfall({
 
   return (
     <svg viewBox={`0 0 ${W} ${totalH}`} className="w-full h-auto" role="img">
-      {/* Baseline header */}
+      {/* Baseline header — regime-aware so SHAP results don't get
+          labelled "(HC)" by accident. */}
       <text x={PAD_X} y={14} fontSize="10" fill="var(--ink-400)">
-        baseline (HC)
+        {baselineLabel(explainerKind)}
       </text>
       <text
         x={PAD_X + BAR_W_MAX / 2}

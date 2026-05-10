@@ -57,6 +57,7 @@ def health():
         model_loaded=inference.is_loaded(),
         model_auc=inference.model_auc(),
         explainer=inference.explainer_kind(),
+        last_used_explainer=inference.last_used_explainer(),
     )
 
 
