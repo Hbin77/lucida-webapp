@@ -14,18 +14,37 @@ MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 
 _model = None
 _meta: dict[str, Any] = {}
+_explainer = None          # shap.TreeExplainer; populated at load
+_shap_available = False    # falls back to single-feature ablation if False
 
 
 def load_model() -> None:
-    """Load RF + feature metadata at process startup."""
-    global _model, _meta
+    """Load RF + feature metadata at process startup.
+
+    We also try to construct a SHAP TreeExplainer. If `shap` is missing
+    or fails to build (e.g. due to a sklearn-version mismatch), we keep
+    the server up and silently fall back to single-feature ablation in
+    explain().  This guarantees /api/explain never 500s for that reason.
+    """
+    global _model, _meta, _explainer, _shap_available
     _model = joblib.load(MODELS_DIR / "lucida_rf.pkl")
     with open(MODELS_DIR / "feature_meta.json") as f:
         _meta = json.load(f)
+    try:
+        import shap  # type: ignore
+        _explainer = shap.TreeExplainer(_model)
+        _shap_available = True
+    except Exception:
+        _explainer = None
+        _shap_available = False
 
 
 def is_loaded() -> bool:
     return _model is not None
+
+
+def explainer_kind() -> str:
+    return "tree_shap" if _shap_available else "single_feature_ablation"
 
 
 def model_auc() -> float:
@@ -255,9 +274,78 @@ def _euclidean(a: dict, b: dict) -> float:
     return total ** 0.5
 
 
+def _ablation_contributions(feats: dict, actual_score: int) -> list[dict]:
+    """Fallback explainer — used when shap is unavailable.
+
+    Single-feature ablation: replace each feature in turn with its HC
+    baseline value and observe the score swing. delta_score = actual −
+    ablated, so negative means the user's value pulls the score down.
+    """
+    baseline = _hc_baseline()
+    contribs = []
+    for f in FEATURE_ORDER:
+        ablated = dict(feats)
+        ablated[f] = baseline[f]
+        ablated_score, _ = _score_from_features(ablated)
+        contribs.append({
+            "feature": f,
+            "value": round(float(feats[f]), 2),
+            "baseline": round(float(baseline[f]), 2),
+            "delta_score": float(actual_score - ablated_score),
+        })
+    return contribs
+
+
+def _shap_contributions(feats: dict) -> list[dict]:
+    """TreeSHAP-based attribution.
+
+    For the at-risk (class 1) probability, a POSITIVE shap value means
+    the feature pushed the probability up — i.e. it pulled the cognitive
+    SCORE down. We sign-flip and rescale to score points (×100) so that
+    the resulting `delta_score` shares the same semantics as the
+    ablation fallback:
+        delta_score > 0  ⇒  feature pushes the score above the base
+        delta_score < 0  ⇒  feature pulls the score below the base
+    """
+    assert _explainer is not None
+    x = _features_to_array(feats)
+    sv = _explainer.shap_values(x)
+    sv = np.asarray(sv)
+
+    # Two shapes are possible across shap / sklearn versions:
+    #   (n_samples, n_features, n_classes)  — sklearn 1.4+ TreeExplainer
+    #   list of length n_classes, each (n_samples, n_features) — older API
+    if sv.ndim == 3:
+        # take class 1 (at-risk) column
+        sv_at_risk = sv[0, :, 1]
+    elif sv.ndim == 2:
+        # only one class returned; treat as at-risk
+        sv_at_risk = sv[0]
+    else:  # ndim == 1
+        sv_at_risk = sv
+
+    baseline_feats = _hc_baseline()
+    contribs = []
+    for i, f in enumerate(FEATURE_ORDER):
+        # +shap on at-risk ⇒ −delta on score
+        delta = -float(sv_at_risk[i]) * 100.0
+        contribs.append({
+            "feature": f,
+            "value": round(float(feats[f]), 2),
+            "baseline": round(float(baseline_feats[f]), 2),
+            "delta_score": round(delta, 2),
+        })
+    return contribs
+
+
 def explain(req: dict) -> dict:
-    """Return per-feature contribution via single-feature ablation,
-    plus standardised distance to each cohort centroid."""
+    """Return per-feature contribution + cohort distances.
+
+    Primary explainer: TreeSHAP (additive, satisfies the efficiency
+    property). Fallback: single-feature ablation against the HC baseline.
+    The fallback path is taken automatically if `shap` failed to load at
+    startup — see load_model().
+    """
     if _model is None:
         raise RuntimeError("Model not loaded — call load_model() first.")
 
@@ -277,28 +365,27 @@ def explain(req: dict) -> dict:
     actual_score, _ = _score_from_features(feats)
     pathway = _classify_pathway(actual_score, int(feats["age"]))
 
-    # Baseline: HC group means → reference "fully healthy" prediction
-    baseline = _hc_baseline()
-    baseline_score, _ = _score_from_features(baseline)
+    # Reference score: the SHAP base (training expectation) if available,
+    # else the score of an all-HC-mean input. Both are valid "what would
+    # the score be without this user's specific values?" anchors; SHAP
+    # uses the training mean of the model output.
+    if _shap_available and _explainer is not None:
+        try:
+            ev = _explainer.expected_value
+            ev = np.asarray(ev).ravel()
+            # ev = [P(class 0), P(class 1)] in the two-class case.
+            prob_at_risk_base = float(ev[-1]) if ev.size >= 2 else float(ev[0])
+            baseline_score = int(round((1.0 - prob_at_risk_base) * 100))
+            contributions = _shap_contributions(feats)
+        except Exception:
+            # Defensive — never let an explainer bug 500 the demo.
+            baseline_score, _ = _score_from_features(_hc_baseline())
+            contributions = _ablation_contributions(feats, actual_score)
+    else:
+        baseline_score, _ = _score_from_features(_hc_baseline())
+        contributions = _ablation_contributions(feats, actual_score)
 
-    # For each feature, swap in the baseline value and re-score.
-    contributions = []
-    for f in FEATURE_ORDER:
-        ablated = dict(feats)
-        ablated[f] = baseline[f]
-        ablated_score, _ = _score_from_features(ablated)
-        contributions.append({
-            "feature": f,
-            "value": round(float(feats[f]), 2),
-            "baseline": round(float(baseline[f]), 2),
-            # delta_score = actual − ablated.
-            #   negative ⇒ swapping this feature to HC baseline RAISES the
-            #              score, so the user's value was pulling score DOWN.
-            #   positive ⇒ user's value pushes score above HC baseline.
-            "delta_score": float(actual_score - ablated_score),
-        })
-
-    # Cohort distances (standardised Euclidean)
+    # Cohort distances (standardised Euclidean), unchanged.
     centroids = _per_group_centroids()
     distances = [
         {"cohort": g, "distance": round(_euclidean(feats, centroids[g]), 3)}

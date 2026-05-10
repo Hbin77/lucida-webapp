@@ -35,6 +35,7 @@ class HealthResponse(BaseModel):
     status: Literal["ok"]
     model_loaded: bool
     model_auc: float
+    explainer: Literal["tree_shap", "single_feature_ablation"] = "single_feature_ablation"
 
 
 # ── Live Typing Lab — raw-features endpoint ──────────────────────

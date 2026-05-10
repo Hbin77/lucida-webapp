@@ -56,6 +56,7 @@ def health():
         status="ok",
         model_loaded=inference.is_loaded(),
         model_auc=inference.model_auc(),
+        explainer=inference.explainer_kind(),
     )
 
 
