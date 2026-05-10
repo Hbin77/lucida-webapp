@@ -5,38 +5,57 @@ runs RF prediction, and produces pathway / premium / outlook fields.
 
 from __future__ import annotations
 import json
+import logging
 import joblib
 import numpy as np
 from pathlib import Path
 from typing import Any
 
+log = logging.getLogger(__name__)
+
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 
-_model = None
+_model: Any = None
 _meta: dict[str, Any] = {}
-_explainer = None          # shap.TreeExplainer; populated at load
-_shap_available = False    # falls back to single-feature ablation if False
+_explainer: Any = None        # shap.TreeExplainer; populated at load
+_shap_available: bool = False  # falls back to single-feature ablation if False
+
+# Tracks the explainer that served the most recent /api/explain request.
+# /api/health reports configured_explainer (startup state) AND
+# last_used_explainer (most recent serve) so a silent per-request fallback
+# does not leave the health endpoint lying.
+_last_used_explainer: str = "single_feature_ablation"
 
 
 def load_model() -> None:
     """Load RF + feature metadata at process startup.
 
-    We also try to construct a SHAP TreeExplainer. If `shap` is missing
-    or fails to build (e.g. due to a sklearn-version mismatch), we keep
-    the server up and silently fall back to single-feature ablation in
-    explain().  This guarantees /api/explain never 500s for that reason.
+    We try to construct a SHAP TreeExplainer pinned to the deterministic
+    `tree_path_dependent` perturbation. If `shap` is missing or the
+    explainer fails to build (e.g. due to a sklearn-version mismatch),
+    the failure is logged at WARNING and we fall back to single-feature
+    ablation in explain(). This guarantees /api/explain never 500s.
     """
-    global _model, _meta, _explainer, _shap_available
+    global _model, _meta, _explainer, _shap_available, _last_used_explainer
     _model = joblib.load(MODELS_DIR / "lucida_rf.pkl")
     with open(MODELS_DIR / "feature_meta.json") as f:
         _meta = json.load(f)
     try:
         import shap  # type: ignore
-        _explainer = shap.TreeExplainer(_model)
+        _explainer = shap.TreeExplainer(
+            _model, feature_perturbation="tree_path_dependent"
+        )
         _shap_available = True
-    except Exception:
+        _last_used_explainer = "tree_shap"
+        log.info("SHAP TreeExplainer ready (tree_path_dependent).")
+    except (ImportError, ValueError, TypeError, AttributeError) as e:
         _explainer = None
         _shap_available = False
+        _last_used_explainer = "single_feature_ablation"
+        log.warning(
+            "SHAP unavailable, /api/explain will use single-feature "
+            "ablation. Reason: %s: %s", type(e).__name__, e,
+        )
 
 
 def is_loaded() -> bool:
@@ -44,7 +63,17 @@ def is_loaded() -> bool:
 
 
 def explainer_kind() -> str:
+    """Configured explainer (startup state). See `last_used_explainer`
+    for the per-request truth — they can diverge if a runtime fallback
+    fires."""
     return "tree_shap" if _shap_available else "single_feature_ablation"
+
+
+def last_used_explainer() -> str:
+    """Reports which explainer actually served the most recent request.
+    Diverges from explainer_kind() only when a runtime fallback occurs
+    inside explain() despite SHAP being available at startup."""
+    return _last_used_explainer
 
 
 def model_auc() -> float:
@@ -280,6 +309,12 @@ def _ablation_contributions(feats: dict, actual_score: int) -> list[dict]:
     Single-feature ablation: replace each feature in turn with its HC
     baseline value and observe the score swing. delta_score = actual −
     ablated, so negative means the user's value pulls the score down.
+
+    Sign convention matches _shap_contributions, but additivity is NOT
+    guaranteed (these are single-feature counterfactuals, not Shapley
+    values; the contributions do not sum to actual_score − baseline_score).
+    The /api/health.last_used_explainer field is the authority for which
+    regime produced a given response.
     """
     baseline = _hc_baseline()
     contribs = []
@@ -291,9 +326,44 @@ def _ablation_contributions(feats: dict, actual_score: int) -> list[dict]:
             "feature": f,
             "value": round(float(feats[f]), 2),
             "baseline": round(float(baseline[f]), 2),
-            "delta_score": float(actual_score - ablated_score),
+            "delta_score": round(float(actual_score - ablated_score), 2),
         })
     return contribs
+
+
+def _extract_shap_at_risk(sv: Any, n_features: int) -> np.ndarray:
+    """Normalise SHAP output to a 1-D length-`n_features` vector for the
+    at-risk (class 1) probability, across SHAP API generations.
+
+    Supported shapes:
+      - list of length n_classes, each (1, n_features) — pre-0.45 SHAP
+      - ndarray (n_samples, n_features, n_classes) — SHAP 0.45+
+      - ndarray (n_classes, n_samples, n_features) — older after np.asarray
+      - ndarray (1, n_features) — single-output edge case
+    Raises ValueError if the shape is unrecognised so the caller can
+    fall through to ablation.
+    """
+    # Pre-0.45 binary RandomForestClassifier returns [sv_class0, sv_class1].
+    if isinstance(sv, list):
+        if len(sv) < 2:
+            raise ValueError(f"SHAP list-output with len={len(sv)}")
+        return np.asarray(sv[1]).reshape(-1)[:n_features]
+
+    arr = np.asarray(sv)
+    if arr.ndim == 3:
+        # (n_samples, n_features, n_classes)  — modern SHAP
+        if arr.shape == (1, n_features, 2):
+            return arr[0, :, 1]
+        # (n_classes, n_samples, n_features)  — list-then-asarray
+        if arr.shape == (2, 1, n_features):
+            return arr[1, 0, :]
+        raise ValueError(f"Unexpected 3-D SHAP shape {arr.shape}")
+    if arr.ndim == 2 and arr.shape == (1, n_features):
+        # Single-output regressor-style return.
+        return arr[0]
+    if arr.ndim == 1 and arr.shape == (n_features,):
+        return arr
+    raise ValueError(f"Unexpected SHAP shape {arr.shape}")
 
 
 def _shap_contributions(feats: dict) -> list[dict]:
@@ -302,27 +372,21 @@ def _shap_contributions(feats: dict) -> list[dict]:
     For the at-risk (class 1) probability, a POSITIVE shap value means
     the feature pushed the probability up — i.e. it pulled the cognitive
     SCORE down. We sign-flip and rescale to score points (×100) so that
-    the resulting `delta_score` shares the same semantics as the
+    the resulting `delta_score` shares the SAME SIGN CONVENTION as the
     ablation fallback:
         delta_score > 0  ⇒  feature pushes the score above the base
         delta_score < 0  ⇒  feature pulls the score below the base
+
+    Unlike ablation, SHAP attributions are ADDITIVE — they sum (up to
+    rounding) to actual_score − baseline_score (the efficiency property).
+    Consumers wanting that identity should check /api/health for
+    last_used_explainer == "tree_shap".
     """
-    assert _explainer is not None
+    if _explainer is None:
+        raise RuntimeError("SHAP explainer not initialised")
     x = _features_to_array(feats)
     sv = _explainer.shap_values(x)
-    sv = np.asarray(sv)
-
-    # Two shapes are possible across shap / sklearn versions:
-    #   (n_samples, n_features, n_classes)  — sklearn 1.4+ TreeExplainer
-    #   list of length n_classes, each (n_samples, n_features) — older API
-    if sv.ndim == 3:
-        # take class 1 (at-risk) column
-        sv_at_risk = sv[0, :, 1]
-    elif sv.ndim == 2:
-        # only one class returned; treat as at-risk
-        sv_at_risk = sv[0]
-    else:  # ndim == 1
-        sv_at_risk = sv
+    sv_at_risk = _extract_shap_at_risk(sv, len(FEATURE_ORDER))
 
     baseline_feats = _hc_baseline()
     contribs = []
@@ -369,21 +433,43 @@ def explain(req: dict) -> dict:
     # else the score of an all-HC-mean input. Both are valid "what would
     # the score be without this user's specific values?" anchors; SHAP
     # uses the training mean of the model output.
+    global _last_used_explainer
     if _shap_available and _explainer is not None:
         try:
-            ev = _explainer.expected_value
-            ev = np.asarray(ev).ravel()
-            # ev = [P(class 0), P(class 1)] in the two-class case.
-            prob_at_risk_base = float(ev[-1]) if ev.size >= 2 else float(ev[0])
+            ev = np.asarray(_explainer.expected_value).ravel()
+            # ev should be [P(class 0), P(class 1)] for a binary RF.
+            if ev.size >= 2:
+                prob_at_risk_base = float(ev[-1])
+            elif ev.size == 1:
+                # Single-output regressor-style return; treat as p(at_risk).
+                prob_at_risk_base = float(ev[0])
+            else:
+                raise ValueError(f"empty expected_value, shape={ev.shape}")
+            # Clamp defensively — TreeSHAP for a probabilistic classifier
+            # MUST return a probability, but a future API drift could ship
+            # margins/log-odds instead, which would yield nonsense scores.
+            if not 0.0 <= prob_at_risk_base <= 1.0:
+                raise ValueError(
+                    f"expected_value out of [0,1]: {prob_at_risk_base}"
+                )
             baseline_score = int(round((1.0 - prob_at_risk_base) * 100))
             contributions = _shap_contributions(feats)
-        except Exception:
-            # Defensive — never let an explainer bug 500 the demo.
+            _last_used_explainer = "tree_shap"
+        except (ValueError, RuntimeError, AttributeError, IndexError) as e:
+            # Per-request fallback. Logged so silent degradation is visible
+            # in `docker compose logs backend` and the next /api/health call
+            # will report last_used_explainer == "single_feature_ablation".
+            log.warning(
+                "Runtime SHAP failure on /api/explain; falling back to "
+                "ablation. Reason: %s: %s", type(e).__name__, e,
+            )
             baseline_score, _ = _score_from_features(_hc_baseline())
             contributions = _ablation_contributions(feats, actual_score)
+            _last_used_explainer = "single_feature_ablation"
     else:
         baseline_score, _ = _score_from_features(_hc_baseline())
         contributions = _ablation_contributions(feats, actual_score)
+        _last_used_explainer = "single_feature_ablation"
 
     # Cohort distances (standardised Euclidean), unchanged.
     centroids = _per_group_centroids()
@@ -398,4 +484,5 @@ def explain(req: dict) -> dict:
         "contributions": contributions,
         "cohort_distances": distances,
         "baseline_score": baseline_score,
+        "explainer": _last_used_explainer,
     }
